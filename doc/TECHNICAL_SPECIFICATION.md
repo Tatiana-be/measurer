@@ -78,21 +78,22 @@ This document defines the technical specification for an automated, cross-platfo
 
 | Req ID | Requirement | Priority | Acceptance Note |
 |--------|-------------|----------|-----------------|
-| FR-BLD-01 | Tool shall invoke `hvigor` via spawned subprocess, capturing root PID | Must | Root PID used for process-tree traversal |
+| FR-BLD-01 | Tool shall invoke hvigor as: `node $NODE_OPTIONS <hvigor_path>/bin/hvigorw.js $HVIGOR_OPTIONS`, capturing the root PID of the spawned `node` process | Must | Root PID (node) used for process-tree traversal; executable name logged as `node (hvigorw.js)` |
 | FR-BLD-02 | Tool shall set `OHOS_SDK_HOME` and related env-vars per selected SDK version | Must | Verified via `sdk validate` pre-run |
 | FR-BLD-03 | Tool shall enforce a configurable build timeout (default: 3600s) | Must | Timeout triggers SIGTERM (Unix) / TerminateJobObject (Win), then SIGKILL after 10s grace |
-| FR-BLD-04 | Tool shall support clean (`hvigor clean`) before each run to ensure cache neutrality | Should | `--skip-clean` flag disables |
+| FR-BLD-04 | Tool shall support clean (`node ... hvigorw.js clean`) before each run to ensure cache neutrality | Should | `--skip-clean` flag disables |
 | FR-BLD-05 | Tool shall capture build exit code, stdout, stderr | Must | Stored alongside metrics |
+| FR-BLD-06 | Tool shall record the resolved paths of `node`, `hvigorw.js`, and the values of `NODE_OPTIONS` / `HVIGOR_OPTIONS` in run metadata | Should | Aids reproducibility and debugging |
 
 ### 2.3 Metric Collection
 
 | Req ID | Requirement | Priority | Acceptance Note |
 |--------|-------------|----------|-----------------|
-| FR-MET-01 | Tool shall sample the full process tree (root `hvigor` + all descendants) at configurable intervals (default: 250ms) | Must | Interval configurable via `--sample-interval-ms` |
+| FR-MET-01 | Tool shall sample the full process tree (root `node` executing hvigorw.js + all descendants) at configurable intervals (default: 250ms) | Must | Interval configurable via `--sample-interval-ms` |
 | FR-MET-02 | Tool shall capture per-sample: RSS, PSS (Linux), approximated PSS (Windows), USS (both platforms via `/proc/smaps` on Linux and `psutil.memory_full_info()` on Windows), CPU user/system time | Must | Windows PSS approximation documented (§5); USS native |
 | FR-MET-03 | Tool shall aggregate samples into: min, max, mean, p50, p90, p95, p99, sum for each metric per process and for the tree aggregate | Must | Aggregation algorithm: linear interpolation between samples |
 | FR-MET-04 | Tool shall record build wall-clock time, CPU time (user + system), and GC pauses (Node.js `--trace-gc` parsing) | Must | GC pause data stored as array of {timestamp, duration_ms, heap_before, heap_after} |
-| FR-MET-05 | Tool shall attach metadata: OS name/version, architecture, SDK version, project identifier, tool version, timestamp (ISO 8601, UTC, with milliseconds), run ID (UUIDv4) | Must | Metadata block included in every output record |
+| FR-MET-05 | Tool shall attach metadata: OS name/version, architecture, SDK version, hvigor version, node path/version, hvigorw.js path, NODE_OPTIONS, HVIGOR_OPTIONS, project identifier, tool version, timestamp (ISO 8601, UTC, with milliseconds), run ID (UUIDv4) | Must | Metadata block included in every output record |
 
 ### 2.4 SDK Management
 
@@ -167,12 +168,23 @@ This document defines the technical specification for an automated, cross-platfo
 
 ### 4.1 Process Tree Coverage
 
-1. **Root Process Identification:** Upon spawning `hvigor`, the tool records the root PID.
-2. **Recursive Discovery:** At each sampling interval, the tool enumerates all direct and transitive child PIDs:
+hvigor is not a standalone binary; it is a JavaScript entry point executed by Node.js. The actual spawn command is:
+
+```
+node $NODE_OPTIONS <hvigor_path>/bin/hvigorw.js $HVIGOR_OPTIONS
+```
+
+This has important implications for process tree tracking:
+
+1. **Root Process Identification:** The tool spawns the command above and captures the PID of the **root `node` process**. This process is labeled internally as `node (hvigorw.js)` to distinguish it from other Node processes.
+2. **Recursive Discovery:** At each sampling interval, the tool enumerates all direct and transitive child PIDs of the root `node` process:
    - **Linux:** Parse `/proc/<pid>/stat` for `ppid`; build tree via reverse mapping.
    - **Windows:** Use `NtQuerySystemInformation(SystemProcessInformation)` or WMI `Win32_Process` to construct parent-child relationships. Job Object assignment recommended if `hvigor` supports it.
-3. **Lifecycle Tracking:** Processes appearing/disappearing between samples are tracked with `start_time` and `end_time`. Metrics are interpolated for partial lifetimes.
-4. **Exclusions:** System processes (PID < 100 on Linux, `System`/`Idle` on Windows) are excluded from aggregation.
+3. **Disambiguation from other Node processes:** Since the root is a generic `node` executable, the tool validates identity by:
+   - Matching the command-line argument containing `hvigorw.js` (via `/proc/<pid>/cmdline` on Linux or `Win32_Process.CommandLine` on Windows).
+   - Correlating spawn timestamp with the tool's own launch time (±2s tolerance).
+4. **Lifecycle Tracking:** Processes appearing/disappearing between samples are tracked with `start_time` and `end_time`. Metrics are interpolated for partial lifetimes.
+5. **Exclusions:** System processes (PID < 100 on Linux, `System`/`Idle` on Windows) are excluded from aggregation.
 
 ### 4.2 Sampling Frequency
 
@@ -210,8 +222,8 @@ A run is considered **valid** if and only if:
 
 1. Build process completed (exit code 0) or failed with captured error (non-zero).
 2. ≥80% of expected samples were collected (≤20% gap tolerance).
-3. Process tree was successfully rooted at `hvigor` PID (orphaned runs are invalid).
-4. Metadata block is complete (all required fields present).
+3. Process tree was successfully rooted at the `node` PID executing `hvigorw.js`, confirmed via command-line matching (orphaned runs are invalid).
+4. Metadata block is complete, including resolved `node` path/version, `hvigorw.js` path, `hvigor_version`, `NODE_OPTIONS`, and `HVIGOR_OPTIONS` values.
 5. No timeout or external kill signal interrupted the run (unless explicitly testing timeout behavior).
 
 Invalid runs are flagged in output with `status: "INVALID"` and a reason code but are **not discarded** from storage (audit trail).
@@ -398,7 +410,13 @@ CREATE TABLE aggregates (
         "build_target": "assembleDebug",
         "build_exit_code": 0,
         "git_commit": "abc1234",
-        "overhead_pct": 1.8
+        "overhead_pct": 1.8,
+        "node_path": "/usr/bin/node",
+        "node_version": "v20.11.0",
+        "hvigorw_path": "/home/user/.deveco-measurer/sdks/5.0.3.900/sdk/hvigor/bin/hvigorw.js",
+        "hvigor_version": "7.0.0",
+        "node_options": "--trace-gc --trace-gc-ignore-scavenger",
+        "hvigor_options": ""
       },
       "build_duration_ms": 323000,
       "cpu_user_ms": 580000,
@@ -613,3 +631,4 @@ If a subset of metrics is unavailable (e.g., PSS on Windows in strict mode, GC t
 |---------|------|--------|---------|
 | 1.0.0 | 2026-04-12 | System Engineering & QA Team | Initial draft for review |
 | 1.1.0 | 2026-04-12 | System Engineering & QA Team | Correct Windows USS availability: `psutil` 7.2.2 provides native USS via `memory_full_info().uss`. Removed USS approximation (§5.2), updated SQLite schema (`uss_bytes` → `INTEGER NOT NULL`), revised metric matrix (§5.1), OS limitations (§9.3), acceptance criteria (AC-04/AC-05) |
+| 1.2.0 | 2026-04-12 | System Engineering & QA Team | Reflect actual hvigor launch command: `node $NODE_OPTIONS <hvigor_path>/bin/hvigorw.js $HVIGOR_OPTIONS`. Updated §2.2 (FR-BLD-01/04/06), §2.3 (FR-MET-01/05), §4.1 (process tree rooting on `node` PID with cmdline-based disambiguation), §4.5 (valid run criteria), §7.2 JSON export (metadata: `node_path`, `node_version`, `hvigorw_path`, `hvigor_version`, `node_options`, `hvigor_options`). Added `hvigor_version` to required metadata |
