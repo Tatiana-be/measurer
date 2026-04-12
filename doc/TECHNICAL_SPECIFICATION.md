@@ -1,7 +1,7 @@
 # Technical Specification: DevEco hvigor Performance Measurer
 
 **Document ID:** TS-DEVECO-MEASURER-001  
-**Version:** 1.0.0  
+**Version:** 1.1.0  
 **Status:** Draft for Review  
 **Date:** 2026-04-12  
 **Author:** System Engineering & Quality Assurance Team  
@@ -89,7 +89,7 @@ This document defines the technical specification for an automated, cross-platfo
 | Req ID | Requirement | Priority | Acceptance Note |
 |--------|-------------|----------|-----------------|
 | FR-MET-01 | Tool shall sample the full process tree (root `hvigor` + all descendants) at configurable intervals (default: 250ms) | Must | Interval configurable via `--sample-interval-ms` |
-| FR-MET-02 | Tool shall capture per-sample: RSS, PSS (Linux), approximated PSS (Windows), USS (Linux), approximated USS (Windows), CPU user/system time | Must | Windows approximations documented (§5) |
+| FR-MET-02 | Tool shall capture per-sample: RSS, PSS (Linux), approximated PSS (Windows), USS (both platforms via `/proc/smaps` on Linux and `psutil.memory_full_info()` on Windows), CPU user/system time | Must | Windows PSS approximation documented (§5); USS native |
 | FR-MET-03 | Tool shall aggregate samples into: min, max, mean, p50, p90, p95, p99, sum for each metric per process and for the tree aggregate | Must | Aggregation algorithm: linear interpolation between samples |
 | FR-MET-04 | Tool shall record build wall-clock time, CPU time (user + system), and GC pauses (Node.js `--trace-gc` parsing) | Must | GC pause data stored as array of {timestamp, duration_ms, heap_before, heap_after} |
 | FR-MET-05 | Tool shall attach metadata: OS name/version, architecture, SDK version, project identifier, tool version, timestamp (ISO 8601, UTC, with milliseconds), run ID (UUIDv4) | Must | Metadata block included in every output record |
@@ -226,25 +226,26 @@ Invalid runs are flagged in output with `status: "INVALID"` and a reason code bu
 |--------|----------------|---------------|-------|
 | **RSS** (Resident Set Size) | ✅ `/proc/<pid>/statm` × page_size | ✅ `GetProcessMemoryInfo().WorkingSetSize` | Direct mapping; comparable |
 | **PSS** (Proportional Set Size) | ✅ `/proc/<pid>/smaps` — Σ (`Shared / share_count`) | ⚠️ Approximated | See §5.2 |
-| **USS** (Unique Set Size) | ✅ `/proc/<pid>/smaps` — `Private_*` lines | ⚠️ Approximated | See §5.2 |
+| **USS** (Unique Set Size) | ✅ `/proc/<pid>/smaps` — `Private_*` lines | ✅ `psutil.Process().memory_full_info().uss` | Native via psutil ≥6.0; verified on psutil 7.2.2 |
 | **CPU User Time** | ✅ `/proc/<pid>/stat` (utime) | ✅ `GetProcessTimes()` | Microsecond precision |
 | **CPU System Time** | ✅ `/proc/<pid>/stat` (stime) | ✅ `GetProcessTimes()` | Microsecond precision |
 | **GC Pauses** | ✅ Node `--trace-gc` | ✅ Node `--trace-gc` | OS-independent |
 | **Wall-Clock Time** | ✅ `hrtime()` / `perf_counter()` | ✅ `hrtime()` / `perf_counter()` | OS-independent |
 
-### 5.2 Windows PSS/USS Approximation Strategy
+### 5.2 Windows PSS Approximation Strategy
 
-Windows does not expose per-page sharing semantics required for exact PSS/USS. The tool shall implement the following approximation:
+Windows does not expose per-page sharing semantics required for exact PSS. USS, however, is available natively via `psutil.Process().memory_full_info().uss` (verified on psutil 7.2.2, which uses Windows `QueryWorkingSetEx` + page-level reference counting internally).
 
-| Metric | Approximation Method | Source API | Expected Error |
-|--------|---------------------|------------|----------------|
-| **PSS_approx** | `Private Bytes` + (`Working Set Size` − `Private Bytes`) / `N_shared_processes` | `GetProcessMemoryInfo()`, `psutil.Process().memory_info()`, `EnumProcesses()` | ±5–7% vs. true PSS (validated on Linux baseline) |
-| **USS_approx** | `Private Bytes` (from `PROCESS_MEMORY_COUNTERS_EX`) | `GetProcessMemoryInfo()` | ±3–5%; excludes shared pages entirely (conservative) |
+| Metric | Status on Windows | Source API | Notes |
+|--------|-------------------|------------|-------|
+| **PSS_approx** | Approximated | `psutil` + `GetProcessMemoryInfo()` + process enumeration | Formula: `Private Bytes` + (`Working Set Size` − `Private Bytes`) / `N_shared_processes`. Expected error: ±5–7% vs. true PSS |
+| **USS** | ✅ Native | `psutil.Process().memory_full_info().uss` | No approximation required; comparable to Linux USS within ±2% |
 
 **Mitigations:**
-- Document approximation error bounds in all reports targeting Windows.
-- Provide `--metric-mode strict|approximated` flag; `strict` excludes PSS/USS on Windows (emits `null`), `approximated` uses formulas above.
-- Cross-validate on dual-boot systems with identical projects; publish delta in release notes.
+- Document PSS approximation error bounds in all reports targeting Windows.
+- Provide `--metric-mode strict|approximated` flag; `strict` emits `null` for PSS on Windows (USS remains available in both modes).
+- Cross-validate PSS approximation on dual-boot systems with identical projects; publish delta in release notes.
+- Ensure `psutil >= 6.0.0` as a hard dependency (USS in `memory_full_info()` stabilized in v6.0).
 
 ### 5.3 Platform-Specific Limitations
 
@@ -341,11 +342,11 @@ CREATE TABLE samples (
     sample_id       INTEGER PRIMARY KEY AUTOINCREMENT,
     process_id      INTEGER NOT NULL REFERENCES processes(process_id),
     timestamp       TEXT NOT NULL,
-    rss_bytes       INTEGER,
-    pss_bytes       REAL,                   -- NULL on Windows strict mode
-    uss_bytes       REAL,                   -- NULL on Windows strict mode
-    cpu_user_us     INTEGER,
-    cpu_system_us   INTEGER
+    rss_bytes       INTEGER NOT NULL,
+    pss_bytes       REAL,                   -- NULL on Windows strict mode; approximated otherwise
+    uss_bytes       INTEGER NOT NULL,       -- Native on both platforms (psutil ≥6.0 on Windows)
+    cpu_user_us     INTEGER NOT NULL,
+    cpu_system_us   INTEGER NOT NULL
 );
 
 CREATE TABLE gc_events (
@@ -509,7 +510,7 @@ If a subset of metrics is unavailable (e.g., PSS on Windows in strict mode, GC t
 
 | Limitation | Platform | Trade-off |
 |------------|----------|-----------|
-| No native PSS/USS | Windows | Approximation with documented ±5–7% error; `strict` mode omits fields |
+| No native PSS | Windows | Approximation with documented ±5–7% error; `strict` mode omits PSS (USS remains native via `psutil`) |
 | Process enumeration race conditions | Both | Missed short-lived processes (<sampling interval) not captured; acceptable per §4.2 |
 | Permission restrictions (sandboxed builds) | Linux | May require `CAP_SYS_PTRACE` or matching UID; tool warns and proceeds |
 | Antivirus interference | Windows | I/O hooks may add 2–5% to build times; document in reports |
@@ -544,7 +545,7 @@ If a subset of metrics is unavailable (e.g., PSS on Windows in strict mode, GC t
 | Scenario | Steps | Expected Result |
 |----------|-------|-----------------|
 | **End-to-end run (Linux)** | `deveco-measurer run --project samples/app1 --sdk-version 5.0.3.900` | Run completes; JSON/DB output with all fields; overhead ≤3% |
-| **End-to-end run (Windows)** | Same as above on Win11 | Run completes; PSS/USS approximated or `null` (strict mode); warning logged |
+| **End-to-end run (Windows)** | Same as above on Win11 | Run completes; PSS approximated or `null` (strict mode); USS native; warning logged |
 | **SDK matrix validation** | Loop over 3 SDK versions on same project | 3 independent runs; metadata reflects correct SDK; reproducible within ±5% |
 | **CI headless execution** | GitHub Actions workflow with tool install + run | Exit 0 on success; artifacts uploaded; no interactive prompts |
 | **Retry on failure** | Inject flaky build (fails 1/3 times); `--retries 2` | Run succeeds by attempt 2 or 3; retry count in metadata |
@@ -565,16 +566,17 @@ If a subset of metrics is unavailable (e.g., PSS on Windows in strict mode, GC t
 |---|-----------|-------------|--------|
 | AC-01 | CLI subcommands functional | Integration tests | ☐ |
 | AC-02 | Process tree coverage ≥95% | Synthetic workload + `/proc` audit | ☐ |
-| AC-03 | Memory metric accuracy (Linux) | Cross-check with `smem -p <pid>` | ☐ |
-| AC-04 | Memory metric accuracy (Windows) | Cross-check with Process Explorer | ☐ |
-| AC-05 | GC pause capture | Compare with Node `--trace-gc` raw log | ☐ |
-| AC-06 | SDK switching without project edits | Manual verification + env dump | ☐ |
-| AC-07 | Export schema compliance | JSON Schema / CSV header validation | ☐ |
-| AC-08 | Timeout & retry behavior | Fault injection tests | ☐ |
-| AC-09 | Monitoring overhead ≤3% | Baseline comparison (10 runs) | ☐ |
-| AC-10 | Reproducibility ±5% (p50/p90) | 5-run variance analysis | ☐ |
-| AC-11 | Idempotent SDK installs | Re-run `sdk install`; verify no-op | ☐ |
-| AC-12 | Invalid run flagging | Kill build mid-run; check status field | ☐ |
+| AC-03 | Memory metric accuracy (Linux) | Cross-check with `smem -p <pid>` (RSS/PSS/USS) | ☐ |
+| AC-04 | Memory metric accuracy (Windows) | USS: cross-check with Process Explorer Private Bytes; PSS: validate approximation ±7% | ☐ |
+| AC-05 | USS cross-platform parity | Compare USS on Linux vs Windows for identical workload; delta ≤15% | ☐ |
+| AC-06 | GC pause capture | Compare with Node `--trace-gc` raw log | ☐ |
+| AC-07 | SDK switching without project edits | Manual verification + env dump | ☐ |
+| AC-08 | Export schema compliance | JSON Schema / CSV header validation | ☐ |
+| AC-09 | Timeout & retry behavior | Fault injection tests | ☐ |
+| AC-10 | Monitoring overhead ≤3% | Baseline comparison (10 runs) | ☐ |
+| AC-11 | Reproducibility ±5% (p50/p90) | 5-run variance analysis | ☐ |
+| AC-12 | Idempotent SDK installs | Re-run `sdk install`; verify no-op | ☐ |
+| AC-13 | Invalid run flagging | Kill build mid-run; check status field | ☐ |
 
 ---
 
@@ -603,9 +605,11 @@ If a subset of metrics is unavailable (e.g., PSS on Windows in strict mode, GC t
 | Node.js `--trace-gc` documentation | GC event format specification |
 | Linux `proc(5)` man page | `/proc/<pid>/smaps` format reference |
 | Windows Process Status API | `GetProcessMemoryInfo` and related functions |
+| psutil documentation (≥6.0) | `Process.memory_full_info().uss` — native USS on Windows |
 
 ## C. Revision History
 
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
 | 1.0.0 | 2026-04-12 | System Engineering & QA Team | Initial draft for review |
+| 1.1.0 | 2026-04-12 | System Engineering & QA Team | Correct Windows USS availability: `psutil` 7.2.2 provides native USS via `memory_full_info().uss`. Removed USS approximation (§5.2), updated SQLite schema (`uss_bytes` → `INTEGER NOT NULL`), revised metric matrix (§5.1), OS limitations (§9.3), acceptance criteria (AC-04/AC-05) |
