@@ -1,72 +1,58 @@
-# Problem Statement & Business Case: Мониторинг производительности системы сборки hvigor в DevEco Studio
+# PROBLEM_STATEMENT.md
 
-## 1. Executive Summary
-Отсутствие систематизированного, кроссплатформенного и автоматизированного механизма замера производительности системы сборки `hvigor` (Node.js) в DevEco Studio препятствует объективной оценке влияния обновлений OHOS SDK, оптимизации CI/CD-инфраструктуры и контроля Developer Experience. Данный бизнес-кейс обосновывает необходимость внедрения инструмента для периодического сбора метрик времени сборки и потребления памяти (RSS, PSS, USS) с учётом всего дерева дочерних процессов, выполнения на Windows и Ubuntu, и поддержки матрицы версий OHOS SDK.
+## 1. Problem Statement
+The `hvigor` build system (Node.js-based, HarmonyOS/DevEco Studio) lacks a standardized, automated mechanism for collecting reproducible, cross-platform performance benchmarks. Current profiling approaches are manual, environment-dependent, and introduce uncontrolled overhead, making it impossible to:
+- Objectively evaluate build duration and memory consumption across multiple OHOS SDK versions.
+- Establish reliable CI/CD quality gates for build regressions or toolchain upgrades.
+- Compare memory (RSS/PSS/USS) and CPU utilization consistently across Windows and Ubuntu.
+- Track Node.js GC impact and full process-tree resource consumption at scale.
+- Maintain auditable, versioned datasets for long-term trend analysis and engineering reviews.
 
-## 2. Current State & Problem Definition
-- **Разрозненность замеров:** Текущие измерения времени и памяти проводятся вручную или ad-hoc скриптами, не охватывают всё дерево процессов `hvigor`, не фиксируют версии SDK и ОС.
-- **Неконтролируемая вариативность:** Разные версии OHOS SDK, состав проектов и окружения ОС дают несопоставимые результаты, что делает невозможным выявление регрессий.
-- **Ограничения ОС:** На Linux доступны точные метрики `/proc/<pid>/smaps` (RSS/PSS/USS), на Windows отсутствуют прямые аналоги PSS/USS, что требует архитектурно обоснованной аппроксимации и документированной погрешности.
-- **Отсутствие автоматизации:** Нет периодического запуска, валидации целостности данных, экспорта в аналитические хранилища или системы алертинга.
+## 2. Business Case & Value Proposition
+**Why it matters:** Build performance directly impacts developer productivity, CI/CD pipeline throughput, and SDK release velocity. Without deterministic, low-overhead metrics, engineering teams cannot confidently upgrade SDKs, optimize build scripts, or enforce performance budgets in automated workflows.
 
-## 3. Business Impact & Pain Points
-| Область | Воздействие при отсутствии инструмента |
-|---------|----------------------------------------|
-| **Developer Experience** | Непредсказуемое время сборки, скрытые утечки памяти в билд-скриптах, замедление feedback loop |
-| **CI/CD & Инфраструктура** | Риск OOM на раннерах, неоптимальный подбор ресурсов, рост облачных затрат на билд-фермы |
-| **Качество SDK** | Регрессии производительности обнаруживаются post-factum, сложно атрибутировать к конкретной версии SDK или зависимости |
-| **Инженерная культура** | Отсутствие baseline-метрик, невозможность data-driven оптимизации `hvigor` и проектных шаблонов |
+**Value delivered:**
+- **Data-Driven Optimization:** Provides immutable, versioned datasets to identify bottlenecks (CPU, memory, GC) before they impact developers.
+- **CI/CD Automation:** Enables headless, machine-readable performance gates (exit codes `0/1/2`, structured logs, JSON/CSV/SQL export) compatible with GitHub Actions, GitLab CI, and Jenkins.
+- **Cross-Platform Parity:** Unified sampling methodology across Windows 10/11 and Ubuntu 20.04–24.04 ensures benchmarks are comparable regardless of host OS.
+- **Zero-Intrusion Design:** Operates strictly as an external observer—no patches to `hvigor`, DevEco Studio, or project configs—preserving upstream integrity and reducing maintenance debt.
+- **SDK Lifecycle Safety:** Isolates, verifies, and switches between ≥3 OHOS SDK versions without modifying project files, enabling safe matrix testing and rapid rollback.
 
-## 4. Objectives & Success Criteria (KPIs)
-| Цель | Критерий успеха |
-|------|-----------------|
-| Автоматизация периодических замеров | Запуск по расписанию/CI-триггеру, 0 ручных вмешательств |
-| Кроссплатформенный сбор метрик | Поддержка Windows 10/11 и Ubuntu 20.04–24.04 с единым контрактом вывода |
-| Охват процессного дерева | Фиксация RSS/PSS/USS и времени для `hvigor` + все дочерние Node/компилятор процессы |
-| Управление матрицей SDK | Автоматическое переключение ≥3 версий OHOS SDK без модификации проектов |
-| Точность и воспроизводимость | Накладные расходы мониторинга ≤3%, погрешность замеров ±5% при идентичных прогонах |
-| Готовность данных к анализу | Экспорт в структурированный формат (JSON/CSV/БД), метаданные (ОС, SDK, проект, дата, статус), хранение ≥12 мес. |
+## 3. Key Success Metrics (Non-Negotiable)
+| Metric | Target | Verification |
+|---|---|---|
+| Monitoring Overhead | ≤3% wall-clock delta vs uninstrumented baseline | 10-run baseline comparison (NFR-ACC-01) |
+| Reproducibility | ±5% (p50/p90), ±8% (p99) | 5 consecutive identical runs (NFR-ACC-02) |
+| Collector Resource Usage | ≤2% single-core CPU, ≤50 MB RSS | Self-monitoring telemetry (NFR-HL-01/02) |
+| CI/CD Compatibility | Headless, structured stderr, exit codes 0/1/2 | GitHub Actions / GitLab CI / Jenkins pipelines |
+| Data Integrity | Append-only, SQLite WAL, atomic commits, `schema_version` on all records | Round-trip export→import validation (NFR-IDM-01/03) |
 
-## 5. Scope & Boundaries
-**In-Scope:**
-- CLI-оркестратор запуска сборок `hvigor`
-- Абстракция сбора метрик времени и памяти (процессное дерево, частота опроса, агрегация)
-- Механизм изоляции и переключения версий OHOS SDK
-- Обработка сбоев, таймауты, ретраи, валидация прогонов
-- Экспорт, версионирование и базовая визуализация метрик
+## 4. Scope & Boundaries
+**In-Scope:** 
+- CLI orchestration (`run`, `schedule`, `sdk`, `export`, `report`)
+- Process-tree metric sampling (default 250ms, configurable 100–1000ms)
+- SDK version management, integrity verification, and `.env` isolation
+- Structured export (JSON/CSV/SQL, optional PostgreSQL/MySQL push)
+- CI/CD headless integration & machine-readable logging
+- Self-telemetry (overhead %, sample gaps, collector resource usage)
 
 **Out-of-Scope:**
-- Модификация исходного кода `hvigor` или DevEco Studio
-- Профилирование runtime-приложений HarmonyOS или UI-инструментов IDE
-- Полноценная BI-платформа (только экспорт в совместимые форматы/БД)
-- Бенчмаркирование компиляторов/линкеров вне контекста `hvigor`
+- Modification of `hvigor`/DevEco Studio source code or project configs
+- IDE/UI or application runtime profiling
+- Built-in BI/dashboard (visualization deferred to downstream consumers)
+- macOS support (deferred to v1.1+)
+- Benchmarking compilers/linkers outside `hvigor` context
 
-## 6. Key Stakeholders
-| Роль | Интерес | Ответственность |
-|------|---------|-----------------|
-| DevEx / SDK Engineering | Контроль регрессий, оптимизация билд-скриптов | Определение метрик, валидация baseline |
-| CI/CD Platform Team | Прогнозирование ресурсов, снижение OOM-инцидентов | Интеграция в пайплайны, алертинг |
-| QA / Performance Team | Автоматизация нагрузочного тестирования сборки | Сценарии валидации, интерпретация данных |
-| Engineering Management | ROI инфраструктуры, скорость доставки | Утверждение roadmap, приоритезация |
+**Hard Constraints:** 
+- Python ≥3.10, `psutil` ≥6.0.0, SQLite (WAL mode)
+- Immutable `RunConfig`; `RunContext` updated only by Orchestrator
+- Strict root-PID validation (`hvigorw.js` cmdline match + ±2s spawn correlation)
+- Windows PSS approximation documented (±5–7% error) or `null` in `--metric-mode strict`
+- All exports & DB records must include `schema_version` (semver)
 
-## 7. Assumptions, Constraints & Risks
-| Фактор | Описание | Стратегия митигации |
-|--------|----------|---------------------|
-| Отсутствие PSS/USS в Windows | ОС не предоставляет точные аналоги; доступны `Private Bytes`, `Working Set`, `Shared Pages` | Использовать аппроксимацию через Native Process API / WMI + `psutil`, явно документировать погрешность ±5–7%, валидировать на эталонных проектах |
-| Overhead мониторинга | Частый опрос дерева процессов может влиять на время сборки | Адаптивный интервал опроса (≤500ms), измерение baseline "без агента", учёт delta в метаданных |
-| Нестабильность дочерних процессов | `hvigor` динамически порождает воркеры/утилиты | Отслеживание через PID-дерево + рекурсивный обход `/proc` или Windows Job Objects / ETW, graceful fallback при раннем завершении |
-| Совместимость SDK | Некоторые версии требуют специфичных путей/переменных | Изоляция через env-vars + конфигурационные профили, pre-flight validation перед запуском |
-
-## 8. Expected Benefits & ROI
-- **Снижение времени обнаружения регрессий** с недель/месяцев до часов/дней
-- **Оптимизация CI/costs**: подбор раннеров под реальные пики памяти, сокращение OOM-перезапусков на 15–30%
-- **Data-driven развитие SDK**: объективная оценка влияния обновлений `hvigor` и зависимостей
-- **Повышение DevEx**: предсказуемое время сборки, прозрачная отчётность, основа для внутренних SLA
-
-## 9. Next Steps & Milestones
-1. Утверждение данного Problem Statement и выделение ресурсов
-2. Разработка и ревью `TECHNICAL_SPECIFICATION.md`
-3. Проектирование и утверждение `ARCHITECTURE.md` (включая ADR по Windows-метрикам)
-4. Реализация MVP: сбор времени + RSS, 1 ОС, 2 SDK, экспорт JSON
-5. Пилотный запуск на CI, валидация точности, доработка PSS/USS и кросс-ОС слоя
-6. Production rollout, интеграция с системами алертинга и дашбордами
+## 5. Assumptions & Architectural Trade-offs
+- `hvigor` is invoked as `node $NODE_OPTIONS <hvigor_path>/bin/hvigorw.js $HVIGOR_OPTIONS`; tool anchors exclusively to this root PID.
+- Sampling (100–1000ms) is chosen over eBPF/ETW to guarantee cross-platform simplicity, zero kernel dependencies, and ≤3% overhead (ADR-001).
+- SQLite is used over external TSDBs for zero-config portability on single-host CI runners (ADR-002).
+- Windows PSS is approximated via `Private + (WorkingSet - Private) / N_shared`; USS is native via `psutil` ≥6.0.0. Cross-platform parity targets ≤15% RSS delta (AC-05).
+- Tool measures itself: overhead, sample gaps, DB write latency, and collector resource usage are first-class exported metrics enabling self-validation against NFRs.
